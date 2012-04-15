@@ -35,6 +35,8 @@
 #include "pub_tool_debuginfo.h"
 #include "pub_tool_libcbase.h"
 #include "pub_tool_options.h"
+#include "pub_tool_mallocfree.h"
+#include "pub_tool_libcbase.h"
 #include "pub_tool_machine.h"     // VG_(fnptr_to_fnentry)
 
 static Bool clo_trace_mem    = False;
@@ -59,8 +61,19 @@ typedef
       EventKind  ekind;
       IRAtom*    addr;
       Int        size;
+      char *    fnname;
    }
    Event;
+typedef struct VirtualStackFrame{
+    struct VirtualStackFrame *next;
+    char *fnname;
+    HWord bp;
+    HWord sp;
+    } VirtualStackFrame;
+typedef struct {
+    VirtualStackFrame *top;
+    Int size;
+    } VirtualStack;
 
 /* Up to this many unnotified events are allowed.  Must be at least two,
    so that reads and writes to the same address can be merged into a modify.
@@ -96,27 +109,90 @@ typedef
 
 static Event events[N_EVENTS];
 static Int   events_used = 0;
+static Char       global_fnname[100];
+static VirtualStack vstack;
 
-
-static VG_REGPARM(2) void trace_instr(Addr addr, SizeT size)
+static void vstack_fn_entry(char *fnname)
 {
-   VG_(printf)("I  %08lx,%lu\n", addr, size);
+    VirtualStackFrame *sf = (VirtualStackFrame *)VG_(malloc)("vstack_fn_entry",
+                                                             sizeof(VirtualStackFrame));
+    sf->fnname = fnname;
+    sf->sp = 0;
+    sf->bp = 0;
+    sf->next = vstack.top;
+    vstack.top = sf;
+    return;
+}
+static void vstack_fn_exit(void)
+{
+    VirtualStackFrame *top = vstack.top;
+    tl_assert(top!=NULL);
+    vstack.top = top->next;
+    VG_(free)(top->fnname);
+    VG_(free)(top);
+}
+static VirtualStackFrame *vstack_get_top(void)
+{
+    return vstack.top;
 }
 
-static VG_REGPARM(2) void trace_load(Addr addr, SizeT size)
+static VG_REGPARM(3) void trace_instr(char *fnname, Addr addr, SizeT size)
 {
-   VG_(printf)(" L %08lx,%lu\n", addr, size);
+   VG_(printf)(" [%s] I  %08lx,%lu\n", fnname, addr, size);
 }
 
-static VG_REGPARM(2) void trace_store(Addr addr, SizeT size)
+static VG_REGPARM(3) void trace_load(char *fnname, Addr addr, SizeT size)
 {
-   VG_(printf)(" S %08lx,%lu\n", addr, size);
+   VirtualStackFrame *top = vstack_get_top();
+   if(top == NULL)
+        return;
+   VG_(printf)(" [%s] L %08lx,%lu\n", top->fnname, addr, size);
 }
 
-static VG_REGPARM(2) void trace_modify(Addr addr, SizeT size)
+static VG_REGPARM(3) void trace_store(char *fnname, Addr addr, SizeT size)
 {
-   VG_(printf)(" M %08lx,%lu\n", addr, size);
+   VirtualStackFrame *top = vstack_get_top();
+   if(top == NULL)
+        return;
+   VG_(printf)(" [%s] S %08lx,%lu\n", top->fnname, addr, size);
 }
+
+static VG_REGPARM(3) void trace_modify(char *fnname, Addr addr, SizeT size)
+{
+   VirtualStackFrame *top = vstack_get_top();
+   if(top == NULL)
+        return;
+   VG_(printf)(" [%s] M %08lx,%lu\n", top->fnname, addr, size);
+}
+static VG_REGPARM(3) void trace_regw(char *fnname, Int reg_no, HWord tmp_val)
+{
+   VirtualStackFrame *top = vstack_get_top();
+   if(top == NULL)
+        return;
+   if(reg_no == 16 && top->sp == 0){
+        top->sp = tmp_val;
+   }
+   else if(reg_no == 20 && top->bp == 0){
+        top->bp = tmp_val;
+   }
+   VG_(printf)(" [%s] %d. RegW <- %08lx\n", top->fnname, reg_no, tmp_val);
+}
+static VG_REGPARM(1) void trace_fnentry(char *fnname)
+{
+   vstack_fn_entry(fnname);
+}
+static VG_REGPARM(0) void trace_fnexit(void)
+{
+   VirtualStackFrame *top = vstack_get_top();
+   tl_assert(top!=NULL);
+   if(VG_(strcmp)(top->fnname,"main")==0){
+        /* Tracing ends as soon as main exits */
+        VG_(printf)("MAIN EXITING\n");
+        clo_trace_mem = False;
+   }
+   vstack_fn_exit();
+}
+
 static VG_REGPARM(0) void trace_debug(void)
 {
    VG_(printf)("Memory Trace Started\n");
@@ -154,8 +230,8 @@ static void flushEvents(IRSB* sb)
       }
 
       // Add the helper.
-      argv = mkIRExprVec_2( ev->addr, mkIRExpr_HWord( ev->size ) );
-      di   = unsafeIRDirty_0_N( /*regparms*/2, 
+      argv = mkIRExprVec_3( mkIRExpr_HWord( (HWord) ev->fnname ), ev->addr, mkIRExpr_HWord( ev->size ) );
+      di   = unsafeIRDirty_0_N( /*regparms*/3, 
                                 helperName, VG_(fnptr_to_fnentry)( helperAddr ),
                                 argv );
       addStmtToIRSB( sb, IRStmt_Dirty(di) );
@@ -182,15 +258,19 @@ static void addEvent_Ir ( IRSB* sb, IRAtom* iaddr, UInt isize )
     evt->ekind = Event_Ir;
     evt->addr  = iaddr;
     evt->size  = isize;
+    evt->fnname = "Instr";
     events_used++;
 }
 static
-void addEvent_Dr ( IRSB* sb, IRAtom* daddr, Int dsize )
+void addEvent_Dr ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
 {
     Event* evt;
     tl_assert(clo_trace_mem);
     tl_assert(isIRAtom(daddr));
     tl_assert(dsize >= 1 && dsize <= MAX_DSIZE);
+    char *buf = (char *)VG_(malloc)("addEvent_Dr",100*sizeof(char));
+    tl_assert(buf!=NULL);
+    VG_(strcpy)(buf,fnname);
     if (events_used == N_EVENTS)
       flushEvents(sb);
     tl_assert(events_used >= 0 && events_used < N_EVENTS);
@@ -198,16 +278,20 @@ void addEvent_Dr ( IRSB* sb, IRAtom* daddr, Int dsize )
     evt->ekind = Event_Dr;
     evt->addr  = daddr;
     evt->size  = dsize;
+    evt->fnname = buf;
     events_used++;
 }
 static
-void addEvent_Dw ( IRSB* sb, IRAtom* daddr, Int dsize )
+void addEvent_Dw ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
 {
     Event* lastEvt;
     Event* evt;
     tl_assert(clo_trace_mem);
     tl_assert(isIRAtom(daddr));
     tl_assert(dsize >= 1 && dsize <= MAX_DSIZE);
+    char *buf = (char *)VG_(malloc)("addEvent_Dw",100*sizeof(char));
+    tl_assert(buf!=NULL);
+    VG_(strcpy)(buf,fnname);
 
     // Is it possible to merge this write with the preceding read?
     lastEvt = &events[events_used-1];
@@ -228,7 +312,57 @@ void addEvent_Dw ( IRSB* sb, IRAtom* daddr, Int dsize )
     evt->ekind = Event_Dw;
     evt->size  = dsize;
     evt->addr  = daddr;
+    evt->fnname = buf;
     events_used++;
+}
+static
+void addEvent_RegW ( IRSB* sb, char *fnname, Int reg_no, IRAtom* tmp_val)
+{
+    IRExpr**   argv;
+    IRDirty*   di;
+    tl_assert(clo_trace_mem);
+    tl_assert(isIRAtom(tmp_val));
+    char *buf = (char *)VG_(malloc)("addEvent_RegW",100*sizeof(char));
+    tl_assert(buf!=NULL);
+    VG_(strcpy)(buf,fnname);
+    argv = mkIRExprVec_3( mkIRExpr_HWord( (HWord) buf ), mkIRExpr_HWord( reg_no ), tmp_val );
+    di   = unsafeIRDirty_0_N( /*regparms*/3, 
+                              "trace_regw", VG_(fnptr_to_fnentry)( trace_regw ),
+                              argv );
+    if(events_used > 0)
+      flushEvents(sb);
+    addStmtToIRSB( sb, IRStmt_Dirty(di) );
+}
+static
+void addEvent_FnEntry ( IRSB* sb, char *fnname)
+{
+    VG_(printf)("-------- FnEntry called with %s ---------\n",fnname);
+    IRExpr**   argv;
+    IRDirty*   di;
+    char *buf = (char *)VG_(malloc)("addEvent_RegW",100*sizeof(char));
+    tl_assert(buf!=NULL);
+    VG_(strcpy)(buf,fnname);
+    argv = mkIRExprVec_1( mkIRExpr_HWord( (HWord) buf ));
+    di   = unsafeIRDirty_0_N( /*regparms*/1, 
+                              "trace_fnentry", VG_(fnptr_to_fnentry)( trace_fnentry ),
+                              argv );
+    if(events_used > 0)
+      flushEvents(sb);
+    addStmtToIRSB( sb, IRStmt_Dirty(di) );
+}
+static
+void addEvent_FnExit ( IRSB* sb)
+{
+    IRExpr**   argv;
+    IRDirty*   di;
+    tl_assert(clo_trace_mem);
+    argv = mkIRExprVec_0();
+    di   = unsafeIRDirty_0_N( /*regparms*/0, 
+                              "trace_fnexit", VG_(fnptr_to_fnentry)( trace_fnexit ),
+                              argv );
+    if(events_used > 0)
+      flushEvents(sb);
+    addStmtToIRSB( sb, IRStmt_Dirty(di) );
 }
 
 /*------------------------------------------------------------*/
@@ -237,6 +371,8 @@ void addEvent_Dw ( IRSB* sb, IRAtom* daddr, Int dsize )
 
 static void sh_post_clo_init(void)
 {
+    vstack.top = NULL;
+    vstack.size = 0;
 }
 
 static
@@ -249,9 +385,9 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
     IRDirty*   di;
     Int        i;
     IRSB*      sbOut;
-    Char       fnname[100];
     IRType     type;
     IRTypeEnv* tyenv = sbIn->tyenv;
+    char *fnname = global_fnname;
     if (gWordTy != hWordTy) {
         /* We don't currently support this case. */
         VG_(tool_panic)("host/guest word size mismatch");
@@ -269,37 +405,54 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
     if (clo_trace_mem) {
        events_used = 0;
     }
-    clo_trace_mem = False;
     for (/*use current i*/; i < sbIn->stmts_used; i++) {
         IRStmt* st = sbIn->stmts[i];
         if (!st || st->tag == Ist_NoOp) continue;
 
-        if(clo_trace_mem){
+        /* Prettyprint All IR statements Starting from main
+           that valgrind has generated */
+        /*if(clo_trace_mem){
             ppIRStmt(st);
             VG_(printf)("\n");
         }
+        */
 
         switch (st->tag) {
            case Ist_NoOp:
            case Ist_AbiHint:
-           case Ist_Put:
            case Ist_PutI:
            case Ist_MBE:
+              break;
+           case Ist_Put:
+              if(clo_trace_mem){
+                  Int reg_no = st->Ist.Put.offset;
+                  if(reg_no == layout->offset_SP || reg_no == 20){
+                     IRExpr* data = st->Ist.Put.data;
+                     if(data->tag == Iex_RdTmp){
+                        /* Add registerwrite instrumentation to IRSBout */
+                        addEvent_RegW( sbOut, fnname, reg_no, data);
+                      }
+                  }
+              }
               addStmtToIRSB( sbOut, st );
               break;
 
            case Ist_IMark:
               if (VG_(get_fnname_if_entry)(
                                             st->Ist.IMark.addr, 
-                                            fnname, sizeof(fnname))){
+                                            fnname, 100)){
+                   VG_(printf)("-- %s --\n",fnname);
                    if(0 == VG_(strcmp)(fnname, "main")) {
                       di = unsafeIRDirty_0_N( 
                               0, "trace_debug", 
                                  VG_(fnptr_to_fnentry)(trace_debug), 
                                  mkIRExprVec_0() );
                       addStmtToIRSB( sbOut, IRStmt_Dirty(di) );
-                      VG_(printf)("SP:%d\n",layout->offset_SP);
+                      //VG_(printf)("SP:%d\n",layout->offset_SP);
                       clo_trace_mem = True;
+                  }
+                  if(clo_trace_mem){
+                       addEvent_FnEntry(sbOut, fnname);
                   }
                }
               if (clo_trace_mem) {
@@ -317,7 +470,7 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
               if (clo_trace_mem) {
                  IRExpr* data = st->Ist.WrTmp.data;
                  if (data->tag == Iex_Load) {
-                    addEvent_Dr( sbOut, data->Iex.Load.addr,
+                    addEvent_Dr( sbOut, fnname, data->Iex.Load.addr,
                                  sizeofIRType(data->Iex.Load.ty) );
                  }
               }
@@ -327,7 +480,7 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
            case Ist_Store:
               if (clo_trace_mem) {
                  IRExpr* data  = st->Ist.Store.data;
-                 addEvent_Dw( sbOut, st->Ist.Store.addr,
+                 addEvent_Dw( sbOut, fnname, st->Ist.Store.addr,
                               sizeofIRType(typeOfIRExpr(tyenv, data)) );
               }
               addStmtToIRSB( sbOut, st );
@@ -343,9 +496,9 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
                     tl_assert(d->mSize != 0);
                     dsize = d->mSize;
                     if (d->mFx == Ifx_Read || d->mFx == Ifx_Modify)
-                       addEvent_Dr( sbOut, d->mAddr, dsize );
+                       addEvent_Dr( sbOut, fnname, d->mAddr, dsize );
                     if (d->mFx == Ifx_Write || d->mFx == Ifx_Modify)
-                       addEvent_Dw( sbOut, d->mAddr, dsize );
+                       addEvent_Dw( sbOut, fnname, d->mAddr, dsize );
                  } else {
                     tl_assert(d->mAddr == NULL);
                     tl_assert(d->mSize == 0);
@@ -369,8 +522,8 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
               dataTy   = typeOfIRExpr(tyenv, cas->dataLo);
               dataSize = sizeofIRType(dataTy);
               if (clo_trace_mem) {
-                 addEvent_Dr( sbOut, cas->addr, dataSize );
-                 addEvent_Dw( sbOut, cas->addr, dataSize );
+                 addEvent_Dr( sbOut, fnname, cas->addr, dataSize );
+                 addEvent_Dw( sbOut, fnname, cas->addr, dataSize );
               }
               addStmtToIRSB( sbOut, st );
               break;
@@ -382,13 +535,13 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
                  /* LL */
                  dataTy = typeOfIRTemp(tyenv, st->Ist.LLSC.result);
                  if (clo_trace_mem)
-                    addEvent_Dr( sbOut, st->Ist.LLSC.addr,
+                    addEvent_Dr( sbOut, fnname, st->Ist.LLSC.addr,
                                         sizeofIRType(dataTy) );
               } else {
                  /* SC */
                  dataTy = typeOfIRExpr(tyenv, st->Ist.LLSC.storedata);
                  if (clo_trace_mem)
-                    addEvent_Dw( sbOut, st->Ist.LLSC.addr,
+                    addEvent_Dw( sbOut, fnname, st->Ist.LLSC.addr,
                                         sizeofIRType(dataTy) );
               }
               addStmtToIRSB( sbOut, st );
@@ -407,6 +560,11 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
               tl_assert(0);
         }
     }
+    if(clo_trace_mem){
+        if(sbIn->jumpkind == Ijk_Ret){
+            addEvent_FnExit(sbOut);
+        }
+    }
     if (clo_trace_mem) {
         /* At the end of the sbIn.  Flush outstandings. */
         flushEvents(sbOut);
@@ -421,7 +579,7 @@ static void sh_fini(Int exitcode)
 static void sh_pre_clo_init(void)
 {
    VG_(details_name)            ("Sherlock");
-   VG_(details_version)         ("0.23");
+   VG_(details_version)         ("0.3");
    VG_(details_description)     ("CS510 Valgrind tool");
    VG_(details_copyright_author)(
       "Copyright (C) 2002-2011, and GNU GPL'd, by Sherlock Holmes");

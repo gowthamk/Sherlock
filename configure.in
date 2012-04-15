@@ -2178,6 +2178,9 @@ AC_CONFIG_FILES([
    sherlock/Makefile
    sherlock/tests/Makefile
    sherlock/docs/Makefile
+   taintgrind/Makefile
+   taintgrind/tests/Makefile
+   taintgrind/docs/Makefile
    exp-sgcheck/Makefile
    exp-sgcheck/tests/Makefile
    drd/Makefile

@@ -10,6 +10,7 @@ TOOLS =		memcheck \
 		lackey \
 		none \
         sherlock \
+        taintgrind \
 		helgrind \
 		drd
 
