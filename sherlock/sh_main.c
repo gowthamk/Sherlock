@@ -179,13 +179,14 @@ static VG_REGPARM(3) void trace_regw(char *fnname, Int reg_no, HWord tmp_val)
 }
 static VG_REGPARM(1) void trace_fnentry(char *fnname)
 {
+   VG_(printf)("-------- FnEntry called with %s ---------\n",fnname);
    vstack_fn_entry(fnname);
 }
 static VG_REGPARM(1) void trace_fnexit(char *fnname)
 {
    VirtualStackFrame *top = vstack_get_top();
    tl_assert(top!=NULL);
-   VG_(printf)("fnexit called with %s while top of stack is %s\n",
+   VG_(printf)("--------- FnExit called with %s while top of stack is %s -----------\n",
                 fnname, top->fnname);
    if(VG_(strcmp)(top->fnname,"main")==0){
         /* Tracing ends as soon as main exits */
@@ -249,6 +250,8 @@ static void flushEvents(IRSB* sb)
 // events into modify events works correctly.
 static void addEvent_Ir ( IRSB* sb, IRAtom* iaddr, UInt isize )
 {
+    /* Not tracking modifies. So Excluded this function */
+    return;
     Event* evt;
     tl_assert(clo_trace_mem);
     tl_assert( (VG_MIN_INSTR_SZB <= isize && isize <= VG_MAX_INSTR_SZB)
@@ -273,8 +276,6 @@ void addEvent_Dr ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
     char *buf = (char *)VG_(malloc)("addEvent_Dr",100*sizeof(char));
     tl_assert(buf!=NULL);
     VG_(strcpy)(buf,fnname);
-    if (events_used == N_EVENTS)
-      flushEvents(sb);
     tl_assert(events_used >= 0 && events_used < N_EVENTS);
     evt = &events[events_used];
     evt->ekind = Event_Dr;
@@ -282,6 +283,8 @@ void addEvent_Dr ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
     evt->size  = dsize;
     evt->fnname = buf;
     events_used++;
+    //if (events_used == N_EVENTS)
+      flushEvents(sb);
 }
 static
 void addEvent_Dw ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
@@ -295,7 +298,7 @@ void addEvent_Dw ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
     tl_assert(buf!=NULL);
     VG_(strcpy)(buf,fnname);
 
-    // Is it possible to merge this write with the preceding read?
+    /*// Is it possible to merge this write with the preceding read?
     lastEvt = &events[events_used-1];
     if (events_used > 0
     && lastEvt->ekind == Event_Dr
@@ -304,11 +307,9 @@ void addEvent_Dw ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
     {
       lastEvt->ekind = Event_Dm;
       return;
-    }
+    }*/
 
     // No.  Add as normal.
-    if (events_used == N_EVENTS)
-      flushEvents(sb);
     tl_assert(events_used >= 0 && events_used < N_EVENTS);
     evt = &events[events_used];
     evt->ekind = Event_Dw;
@@ -316,6 +317,8 @@ void addEvent_Dw ( IRSB* sb, char *fnname, IRAtom* daddr, Int dsize )
     evt->addr  = daddr;
     evt->fnname = buf;
     events_used++;
+    //if (events_used == N_EVENTS)
+      flushEvents(sb);
 }
 static
 void addEvent_RegW ( IRSB* sb, char *fnname, Int reg_no, IRAtom* tmp_val)
@@ -338,7 +341,6 @@ void addEvent_RegW ( IRSB* sb, char *fnname, Int reg_no, IRAtom* tmp_val)
 static
 void addEvent_FnEntry ( IRSB* sb, char *fnname)
 {
-    VG_(printf)("-------- FnEntry called with %s ---------\n",fnname);
     IRExpr**   argv;
     IRDirty*   di;
     char *buf = (char *)VG_(malloc)("addEvent_FnEntry",100*sizeof(char));
