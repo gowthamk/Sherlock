@@ -1,0 +1,48 @@
+==29312== Sherlock-0.23, CS510 Valgrind tool
+==29312== Copyright (C) 2002-2011, and GNU GPL'd, by Sherlock Holmes
+==29312== Using Valgrind-3.8.0.SVN and LibVEX; rerun with -h for copyright info
+==29312== Command: ./vacuum
+==29312== Parent PID: 15714
+==29312== 
+SP:16
+/* BY THIS TIME SP WOULD BE POINTING TO THE TOP OF THE STACK OF CALLER */
+/* ORIGINAL INSTR : pushl %ebp  */
+/* Getting %ebp */ 
+t0 = GET:I32(20)
+/* Getting %esp */ 
+t16 = GET:I32(16)
+/* Incrementing Stack by 4 */
+t15 = Sub32(t16,0x4:I32)
+/* SP to the top of the stack */
+PUT(16) = t15
+/* Copy caller %ebp to the top of the stack */
+STle(t15) = t0
+------ IMark(0x8048395, 2, 0) ------
+/* ORIGINAL INSTR : movl %esp, %ebp  */
+PUT(20) = t15
+------ IMark(0x8048397, 1, 0) ------
+/* setting %eip?? */
+PUT(60) = 0x8048397:I32
+/* ORIGINAL INSTR : Leave - movl%ebp, %esp ; popl %ebp  */
+/* getting caller's %ebp */
+t2 = LDle:I32(t15)
+/* Decrementing the stack pointer */
+t9 = Add32(t15,0x4:I32)
+/* Restoring stack pointer */
+PUT(16) = t9
+/* pop %ebx - Restoring base pointer*/
+PUT(20) = t2
+------ IMark(0x8048398, 1, 0) ------
+/* setting %eip?? */
+PUT(60) = 0x8048398:I32
+/* ORIGINAL INSTR : popl ??  */
+/* Load top of the stack */
+t5 = LDle:I32(t9)
+/* Decrement stack */
+t10 = Add32(t9,0x4:I32)
+PUT(16) = t10
+Memory Trace Started
+ S be999378,4
+ L be999378,4
+ L be99937c,4
+==29311== 

@@ -181,10 +181,12 @@ static VG_REGPARM(1) void trace_fnentry(char *fnname)
 {
    vstack_fn_entry(fnname);
 }
-static VG_REGPARM(0) void trace_fnexit(void)
+static VG_REGPARM(1) void trace_fnexit(char *fnname)
 {
    VirtualStackFrame *top = vstack_get_top();
    tl_assert(top!=NULL);
+   VG_(printf)("fnexit called with %s while top of stack is %s\n",
+                fnname, top->fnname);
    if(VG_(strcmp)(top->fnname,"main")==0){
         /* Tracing ends as soon as main exits */
         VG_(printf)("MAIN EXITING\n");
@@ -339,7 +341,7 @@ void addEvent_FnEntry ( IRSB* sb, char *fnname)
     VG_(printf)("-------- FnEntry called with %s ---------\n",fnname);
     IRExpr**   argv;
     IRDirty*   di;
-    char *buf = (char *)VG_(malloc)("addEvent_RegW",100*sizeof(char));
+    char *buf = (char *)VG_(malloc)("addEvent_FnEntry",100*sizeof(char));
     tl_assert(buf!=NULL);
     VG_(strcpy)(buf,fnname);
     argv = mkIRExprVec_1( mkIRExpr_HWord( (HWord) buf ));
@@ -351,13 +353,16 @@ void addEvent_FnEntry ( IRSB* sb, char *fnname)
     addStmtToIRSB( sb, IRStmt_Dirty(di) );
 }
 static
-void addEvent_FnExit ( IRSB* sb)
+void addEvent_FnExit ( IRSB* sb,char *fnname)
 {
     IRExpr**   argv;
     IRDirty*   di;
     tl_assert(clo_trace_mem);
-    argv = mkIRExprVec_0();
-    di   = unsafeIRDirty_0_N( /*regparms*/0, 
+    char *buf = (char *)VG_(malloc)("addEvent_FnExit",100*sizeof(char));
+    tl_assert(buf!=NULL);
+    VG_(strcpy)(buf,fnname);
+    argv = mkIRExprVec_1( mkIRExpr_HWord( (HWord) buf ));
+    di   = unsafeIRDirty_0_N( /*regparms*/1, 
                               "trace_fnexit", VG_(fnptr_to_fnentry)( trace_fnexit ),
                               argv );
     if(events_used > 0)
@@ -387,6 +392,7 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
     IRSB*      sbOut;
     IRType     type;
     IRTypeEnv* tyenv = sbIn->tyenv;
+    IRStmt*    imarkst;
     char *fnname = global_fnname;
     if (gWordTy != hWordTy) {
         /* We don't currently support this case. */
@@ -438,10 +444,11 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
               break;
 
            case Ist_IMark:
+              imarkst = st;
               if (VG_(get_fnname_if_entry)(
                                             st->Ist.IMark.addr, 
                                             fnname, 100)){
-                   VG_(printf)("-- %s --\n",fnname);
+                   //VG_(printf)("-- %s --\n",fnname);
                    if(0 == VG_(strcmp)(fnname, "main")) {
                       di = unsafeIRDirty_0_N( 
                               0, "trace_debug", 
@@ -562,7 +569,9 @@ IRSB* sh_instrument ( VgCallbackClosure* closure,
     }
     if(clo_trace_mem){
         if(sbIn->jumpkind == Ijk_Ret){
-            addEvent_FnExit(sbOut);
+            VG_(get_fnname)(imarkst->Ist.IMark.addr, 
+                                            fnname, 100);
+            addEvent_FnExit(sbOut,fnname);
         }
     }
     if (clo_trace_mem) {
